@@ -19,7 +19,7 @@ def _json_bytes(payload):
     return json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
 
 
-def create_handler(service, rules, static_dir):
+def create_handler(service, rules, static_dir, federation=None, merger=None, ledgers=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "ModularPython/1.0"
 
@@ -85,6 +85,25 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if len(parts) == 5 and parts[:3] == ["api", "federation", "ledgers"] and parts[4] == "grants":
+                    ledger = ledgers.get(parts[3])
+                    return self._send(200, {"items": ledger.list_grants()})
+                if len(parts) == 5 and parts[:3] == ["api", "federation", "ledgers"] and parts[4] == "ops":
+                    ledger = ledgers.get(parts[3])
+                    return self._send(200, {"items": ledger.list_pending_ops()})
+                if parts == ["api", "federation", "reconciliation"]:
+                    query = parse_qs(parsed.query)
+                    institution_id = query.get("institution", [None])[0]
+                    return self._send(
+                        200,
+                        {"items": service.repository.list_reconciliation(institution_id)},
+                    )
+                if len(parts) == 4 and parts[:3] == ["api", "federation", "merges"]:
+                    merge = service.repository.get_merge(parts[3])
+                    if not merge:
+                        raise NotFoundError("merge not found: " + parts[3])
+                    merge["items"] = service.repository.list_merge_items(parts[3])
+                    return self._send(200, merge)
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -107,6 +126,61 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if (len(parts) == 7 and parts[:3] == ["api", "federation", "ledgers"]
+                        and parts[6] == "register"):
+                    ledger = ledgers.get(parts[3])
+                    body = self._body()
+                    grant_id = body.get("grant_id")
+                    if not grant_id:
+                        raise ValidationError("grant_id is required")
+                    master = service.get(grant_id)
+                    policy_version = int(master["data"].get("policy_version", 1))
+                    return self._send(
+                        201,
+                        ledger.register_grant(
+                            grant_id, data=master["data"], policy_version=policy_version
+                        ),
+                    )
+                if (len(parts) == 7 and parts[:3] == ["api", "federation", "ledgers"]
+                        and parts[6] == "activate"):
+                    ledger = ledgers.get(parts[3])
+                    body = self._body()
+                    op_id = ledger.activate(parts[5], body.get("starts_at"), body.get("expires_at"))
+                    return self._send(202, {"op_id": op_id, "state": "pending"})
+                if (len(parts) == 7 and parts[:3] == ["api", "federation", "ledgers"]
+                        and parts[6] == "revoke"):
+                    ledger = ledgers.get(parts[3])
+                    body = self._body()
+                    op_id = ledger.revoke(parts[5], body.get("reason"))
+                    return self._send(202, {"op_id": op_id, "state": "pending"})
+                if (len(parts) == 5 and parts[:3] == ["api", "federation", "merges"]
+                        and parts[4] != "run"):
+                    merge = service.repository.get_merge(parts[4])
+                    if not merge:
+                        raise NotFoundError("merge not found: " + parts[4])
+                    merge["items"] = service.repository.list_merge_items(parts[4])
+                    return self._send(200, merge)
+                if (len(parts) == 5 and parts[:3] == ["api", "federation", "ledgers"]
+                        and parts[4] == "reconcile"):
+                    ledger = ledgers.get(parts[3])
+                    results = federation.reconcile_ledger(ledger)
+                    return self._send(200, {"items": results})
+                if parts == ["api", "federation", "merges"]:
+                    body = self._body()
+                    merge = merger.start_merge(
+                        actor,
+                        body.get("from_institution"),
+                        body.get("to_institution"),
+                        body.get("merge_id"),
+                    )
+                    return self._send(201, merge)
+                if (len(parts) == 5 and parts[:3] == ["api", "federation", "merges"]
+                        and parts[4] == "run"):
+                    body = self._body()
+                    merge, migrated = merger.run_merge(
+                        actor, parts[3], body.get("limit")
+                    )
+                    return self._send(200, {"merge": merge, "migrated": migrated})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
@@ -152,6 +226,6 @@ def create_handler(service, rules, static_dir):
     return Handler
 
 
-def create_server(host, port, service, rules, static_dir):
-    handler = create_handler(service, rules, static_dir)
+def create_server(host, port, service, rules, static_dir, federation=None, merger=None, ledgers=None):
+    handler = create_handler(service, rules, static_dir, federation, merger, ledgers)
     return ThreadingHTTPServer((host, int(port)), handler)

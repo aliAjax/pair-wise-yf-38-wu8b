@@ -27,6 +27,8 @@ class DomainService:
                 if entity:
                     return entity
         self.rules.validate_create(actor, kind, payload, self._lookup)
+        if kind == "grant":
+            payload.setdefault("policy_version", 1)
         entity_id = str(payload.pop("id", "") or uuid4())
         if self.repository.get_entity(entity_id):
             raise ConflictError("entity already exists: " + entity_id)
