@@ -13,6 +13,11 @@ def _validate_dataset(actor, data, lookup):
         raise ValidationError("access_policy is required")
 
 
+def _validate_institution(actor, data, lookup):
+    if not data.get("name", "").strip():
+        raise ValidationError("institution name is required")
+
+
 def _validate_application(actor, data, lookup):
     dataset = _find_one(lookup, "dataset", "id", data.get("dataset_id"))
     if not dataset:
@@ -39,18 +44,18 @@ def _validate_grant_activate(actor, entity, data, lookup):
     return {"activated_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application}
+CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application, 'institution': _validate_institution}
 CUSTOM_TRANSITIONS = {('application', 'approve'): _validate_approve, ('grant', 'activate'): _validate_grant_activate}
 
 
 class RuleEngine:
-    ALIASES = {'datasets': 'dataset', 'applications': 'application', 'grants': 'grant'}
-    INITIAL_STATUS = {'dataset': 'registered', 'application': 'draft', 'grant': 'issued'}
-    TRANSITIONS = {'dataset': {'restrict': (('registered',), 'restricted'), 'publish': (('restricted',), 'published')}, 'application': {'submit': (('draft',), 'submitted'), 'review': (('submitted',), 'under_review'), 'approve': (('under_review',), 'approved'), 'reject': (('under_review',), 'rejected'), 'withdraw': (('submitted', 'under_review'), 'withdrawn')}, 'grant': {'activate': (('issued',), 'active'), 'revoke': (('active',), 'revoked'), 'expire': (('active',), 'expired')}}
-    CREATE_REQUIRED = {'dataset': ('name', 'access_policy'), 'application': ('dataset_id', 'applicant_id', 'purpose'), 'grant': ('application_id', 'dataset_id', 'recipient')}
-    ACTION_REQUIRED = {('dataset', 'restrict'): ('reason',), ('application', 'review'): ('committee_id',), ('application', 'approve'): ('approvals', 'terms', 'expires_at'), ('application', 'reject'): ('reason',), ('application', 'withdraw'): ('reason',), ('grant', 'activate'): ('starts_at', 'expires_at'), ('grant', 'revoke'): ('reason',), ('grant', 'expire'): ('expired_at',)}
-    CREATE_ROLES = {'dataset': ('admin', 'committee'), 'application': ('admin', 'applicant'), 'grant': ('admin', 'committee')}
-    ROLE_ACTIONS = {'restrict': ('admin', 'committee'), 'publish': ('admin', 'committee'), 'submit': ('admin', 'applicant'), 'review': ('admin', 'committee'), 'approve': ('admin', 'committee'), 'reject': ('admin', 'committee'), 'withdraw': ('admin', 'applicant'), 'activate': ('admin', 'committee'), 'revoke': ('admin', 'committee'), 'expire': ('admin', 'committee')}
+    ALIASES = {'datasets': 'dataset', 'applications': 'application', 'grants': 'grant', 'institutions': 'institution'}
+    INITIAL_STATUS = {'dataset': 'registered', 'application': 'draft', 'grant': 'issued', 'institution': 'active'}
+    TRANSITIONS = {'dataset': {'restrict': (('registered',), 'restricted'), 'publish': (('restricted',), 'published')}, 'application': {'submit': (('draft',), 'submitted'), 'review': (('submitted',), 'under_review'), 'approve': (('under_review',), 'approved'), 'reject': (('under_review',), 'rejected'), 'withdraw': (('submitted', 'under_review'), 'withdrawn')}, 'grant': {'activate': (('issued', 'returned_for_review'), 'active'), 'revoke': (('active', 'returned_for_review'), 'revoked'), 'expire': (('active',), 'expired'), 'invalidate': (('issued',), 'returned_for_review')}}
+    CREATE_REQUIRED = {'dataset': ('name', 'access_policy'), 'application': ('dataset_id', 'applicant_id', 'purpose'), 'grant': ('application_id', 'dataset_id', 'recipient'), 'institution': ('name',)}
+    ACTION_REQUIRED = {('dataset', 'restrict'): ('reason',), ('application', 'review'): ('committee_id',), ('application', 'approve'): ('approvals', 'terms', 'expires_at'), ('application', 'reject'): ('reason',), ('application', 'withdraw'): ('reason',), ('grant', 'activate'): ('starts_at', 'expires_at'), ('grant', 'revoke'): ('reason',), ('grant', 'expire'): ('expired_at',), ('grant', 'invalidate'): ('reason',), ('grant', 'change_deadline'): ('expires_at',)}
+    CREATE_ROLES = {'dataset': ('admin', 'committee'), 'application': ('admin', 'applicant'), 'grant': ('admin', 'committee'), 'institution': ('admin',)}
+    ROLE_ACTIONS = {'restrict': ('admin', 'committee'), 'publish': ('admin', 'committee'), 'submit': ('admin', 'applicant'), 'review': ('admin', 'committee'), 'approve': ('admin', 'committee'), 'reject': ('admin', 'committee'), 'withdraw': ('admin', 'applicant'), 'activate': ('admin', 'committee'), 'revoke': ('admin', 'committee'), 'expire': ('admin', 'committee'), 'invalidate': ('admin', 'committee'), 'change_deadline': ('admin', 'committee')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -105,6 +110,27 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def validate_change_deadline(self, actor, entity, data, lookup=None):
+        kind = self.normalize_kind(entity["kind"])
+        if kind != "grant":
+            raise InvalidTransition("change_deadline only applies to grants")
+        self._ensure_role(
+            actor, self.ROLE_ACTIONS.get(("grant", "change_deadline"), ("admin", "committee"))
+        )
+        self._require(data, self.ACTION_REQUIRED.get(("grant", "change_deadline"), ()))
+        return data["expires_at"]
+
+    def affected_by_restrict(self, dataset, lookup):
+        """Grants that must be invalidated when a dataset is restricted.
+
+        Only locally issued (non-activated) grants are returned for review;
+        active grants have already taken effect and are not rolled back.
+        """
+        if lookup is None:
+            return []
+        grants = lookup("grant", "dataset_id", dataset["id"]) or []
+        return [g for g in grants if g["status"] == "issued"]
 
 
 def _find_one(lookup, kind, field, value):

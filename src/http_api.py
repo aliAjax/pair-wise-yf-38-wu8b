@@ -138,6 +138,32 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if parts == ["api", "reconcile"]:
+                    body = self._body()
+                    idem = self.headers.get("Idempotency-Key") or body.pop("idempotency_key", None)
+                    return self._send(
+                        200,
+                        {
+                            "results": service.reconcile(
+                                actor,
+                                body.get("institution_id"),
+                                body.get("items", []),
+                                idem,
+                            )
+                        },
+                    )
+                if parts == ["api", "migrate"]:
+                    body = self._body()
+                    idem = self.headers.get("Idempotency-Key") or body.pop("idempotency_key", None)
+                    return self._send(
+                        200,
+                        service.migrate_institution(
+                            actor,
+                            body.get("source_id"),
+                            body.get("target_id"),
+                            idem,
+                        ),
+                    )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")

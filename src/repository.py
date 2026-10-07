@@ -54,6 +54,9 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_grant_number_unique
+                    ON entities(json_extract(data, '$.grant_number'))
+                    WHERE kind = 'grant' AND json_extract(data, '$.grant_number') IS NOT NULL;
             """)
 
     @staticmethod
@@ -72,12 +75,15 @@ class SQLiteRepository:
     def create_entity(self, entity_id, kind, status, data, actor_id):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
-                (entity_id, kind, status, payload, actor_id, now, now),
-            )
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                    (entity_id, kind, status, payload, actor_id, now, now),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("duplicate constraint violated: " + str(exc)) from exc
         return self.get_entity(entity_id)
 
     def get_entity(self, entity_id):
@@ -109,6 +115,29 @@ class SQLiteRepository:
             for entity in self.list_entities(kind=kind)
             if (entity["id"] == value if field == "id" else entity["data"].get(field) == value)
         ]
+
+    def find_grant_by_number(self, grant_number):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM entities "
+                "WHERE kind = 'grant' AND json_extract(data, '$.grant_number') = ?",
+                (grant_number,),
+            ).fetchone()
+        return self._entity_from_row(row) if row else None
+
+    def list_grants_by_institution(self, institution_id, limit=None, cursor=None):
+        clauses = ["kind = 'grant'", "json_extract(data, '$.institution_id') = ?"]
+        params = [institution_id]
+        if cursor:
+            clauses.append("id > ?")
+            params.append(cursor)
+        query = "SELECT * FROM entities WHERE " + " AND ".join(clauses) + " ORDER BY id"
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [self._entity_from_row(row) for row in rows]
 
     def update_entity(self, entity_id, expected_version, status, data):
         now = utcnow()
